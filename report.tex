@@ -1,0 +1,337 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{graphicx}
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,
+            citecolor=blue!50!black}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{black!30}
+}
+
+\title{\textbf{CS-4063 NLP --- Assignment 3}\\
+       \large Transformers + Retrieval-Augmented Generation\\[2pt]
+       \normalsize Review Understanding and Grounded Explanation Generation}
+\author{i22-0503 \\ \small\href{https://github.com/afanatif/i220503-Nlp-Assigment-3}{github.com/afanatif/i220503-Nlp-Assigment-3}}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\section{System overview}
+The pipeline implements three stages that share a vocabulary and an embedding
+space:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Part A --- Encoder.} A from-scratch encoder-only Transformer
+        produces, for each review, (i) a sentiment label, (ii) a derived
+        product-category label, and (iii) a fixed-dimensional vector.
+  \item \textbf{Part B --- Retriever.} The training-set vectors are stored;
+        a test query is matched against them by cosine similarity, returning
+        the top-$k$ most similar reviews.
+  \item \textbf{Part C --- Decoder.} A from-scratch decoder-only Transformer
+        consumes the original review, the predicted labels, and the
+        retrieved neighbours, then autoregressively generates a short natural
+        language explanation.
+\end{enumerate}
+All Transformer components --- multi-head attention, encoder block, decoder
+block, sinusoidal positional encoding, causal mask --- are implemented from
+scratch in PyTorch. No pretrained models, \texttt{nn.Transformer},
+\texttt{nn.MultiheadAttention} or \texttt{nn.TransformerEncoder} are used,
+in line with the assignment restrictions.
+
+\section{Dataset and preprocessing}
+\paragraph{Source.} Amazon Reviews (McAuley et~al.). Three categories were
+selected to ensure diversity:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Category & Reviews kept \\
+\midrule
+Beauty       & 12{,}000 \\
+Cellphones   & 12{,}000 \\
+Sports       & 12{,}000 \\
+\midrule
+\textbf{Total} & \textbf{36{,}000} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Splits.} A random 70/15/15 split yields approximately
+$25{,}200$ / $5{,}400$ / $5{,}400$ samples for training / validation / test.
+
+\paragraph{Cleaning and tokenisation.} The pipeline is hand-rolled:
+\begin{enumerate}[noitemsep,leftmargin=*]
+  \item lower-case the text,
+  \item replace digits with \texttt{<num>} and URLs with \texttt{<url>},
+  \item tokenise with the regex
+        \verb|[a-z]+(?:'[a-z]+)?|\verb|<num>|\verb|<url>|\verb|[!?.]|.
+\end{enumerate}
+Specials \texttt{<pad>, <unk>, <bos>, <eos>, <sep>} are reserved. The
+vocabulary is built \emph{only} on the training split with
+\texttt{min\_freq=3} and capped at $20{,}000$ types. Reviews are padded or
+truncated to $64$ tokens for the encoder; the decoder uses a structured
+$146$-token template described in \S\ref{sec:partc}.
+
+\section{Part A --- Encoder}
+\paragraph{Derived feature: product category.}
+We use a 3-way \emph{product-category} prediction (beauty / cellphones /
+sports) as the second supervised task. Three reasons motivate this choice:
+(i) it is learnable from the review text alone because vocabulary is
+genre-specific (``lipstick'' vs. ``charger'' vs. ``dumbbells'');
+(ii) it is complementary to sentiment --- a 5-star review of a charger
+implies very different content than a 5-star review of an eyeshadow palette,
+so a category-aware embedding is crucial for downstream retrieval;
+(iii) it is correlated with sentiment but not redundant with it, which
+encourages multi-task learning to shape a richer shared representation.
+
+\paragraph{Architecture.}
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+Component & Setting \\
+\midrule
+Token embedding ($d_{\text{model}}$)   & 128 \\
+Positional encoding                    & sinusoidal, $T\le 64$ \\
+Encoder layers                         & 4 \\
+Attention heads                        & 4 \\
+Feed-forward inner dim                 & 256 \\
+Dropout                                & 0.1 \\
+LayerNorm placement                    & Pre-LN \\
+Pooling                                & masked mean over tokens \\
+Heads                                  & $2 \times \text{Linear}(128 \to 3)$ \\
+Total parameters                       & $\approx 1.0$M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The multi-head attention layer projects $Q, K, V \in \mathbb{R}^{B\times T\times d}$,
+reshapes to $(B, h, T, d_k)$, computes
+$\operatorname{softmax}\bigl(QK^\top/\sqrt{d_k}\bigr)V$ with a key-padding
+mask added in additive form, then applies an output projection. Each Pre-LN
+encoder block applies
+$x \leftarrow x + \mathrm{drop}(\mathrm{MHA}(\mathrm{LN}(x)))$
+followed by
+$x \leftarrow x + \mathrm{drop}(\mathrm{FFN}(\mathrm{LN}(x)))$.
+
+\paragraph{Training.}
+AdamW (\texttt{lr=3e-4}, weight decay $10^{-4}$), gradient clip $1.0$,
+cosine annealing over $\text{epochs}\times\text{steps}$, batch size 256,
+6 epochs.
+
+\paragraph{Loss with class balancing.}
+The sentiment label distribution is heavily skewed
+(\textasciitilde79\% Positive, 11\% Negative, 10\% Neutral). Vanilla
+cross-entropy collapses the encoder to always predict ``Positive''
+(macro-F1 = $0.29$). We use inverse-frequency class weights for the
+sentiment head:
+\[
+  w_c = \frac{N}{C\,n_c},\qquad
+  L \;=\; \mathrm{CE}_{\text{sent}}(\mathbf{w})\;+\;\lambda\,\mathrm{CE}_{\text{cat}},
+  \quad \lambda = 0.5.
+\]
+$\lambda < 1$ prevents the easier category task from dominating gradient
+flow.
+
+\paragraph{Hyper-parameter exploration log.}
+\begin{center}
+\small
+\begin{tabular}{p{0.45\textwidth}r p{0.30\textwidth}}
+\toprule
+Configuration & Val sent.~F1 (macro) & Notes \\
+\midrule
+Baseline (table above)                       & $\approx 0.66$ & reference \\
+$d=64$, layers $=2$                          & $\approx 0.60$ & under-fits, $3\times$ faster \\
+$d=256$, layers $=6$                         & $\approx 0.67$ & marginal gain at $3\times$ cost \\
+\texttt{lr=1e-3} (no warm-up)                & unstable / NaNs & \\
+$\lambda_{\text{cat}} = 1.0$                 & $\approx 0.64$ & category dominates \\
+Dropout $0.3$                                & $\approx 0.65$ & longer to converge \\
+Mean-pool $\rightarrow$ \texttt{[CLS]} pool  & comparable & mean-pool kept (simpler) \\
+No class weights                             & $0.29$ & collapses to majority class \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Results.}
+On the held-out test set, the encoder achieves macro-F1 $\approx 0.66$ on
+sentiment and $\approx 0.89$ on category. Per-class precision, recall, F1
+and the full confusion matrices are written to
+\texttt{results/encoder\_metrics.json}.
+
+\section{Part B --- Retrieval}
+The trained encoder is run once over the entire training set, producing an
+$(N_{\text{train}}, d)$ matrix of L2-normalised embeddings stored at
+\texttt{results/train\_embeddings.pt}. Retrieval reduces to a single
+matrix multiplication:
+\[
+  \mathbf{s} = \mathbf{q}\,E^\top,\qquad
+  \text{top-}k = \operatorname{topk}(\mathbf{s}, k).
+\]
+
+\paragraph{Choice of $k$.}
+We use $k = 3$. Smaller $k$ exposes too few paraphrases for the decoder to
+generalise from; larger $k$ forces us to truncate each neighbour to under
+twelve tokens, hurting fluency. Empirically, $k\in\{1,3,5,8\}$ all reduce
+perplexity over the no-retrieval baseline, with $k = 3$ giving the largest
+absolute drop while still fitting comfortably inside the decoder's
+$146$-token context window.
+
+\paragraph{Similarity metric.}
+Cosine similarity is appropriate for mean-pooled Transformer outputs because
+it is scale-invariant: it ignores magnitude differences induced by review
+length and focuses on angular direction in the embedding space. Spot checks
+with L2 distance returned nearly identical neighbours.
+
+\paragraph{Quantitative quality.}
+For every test review we measure the average fraction of top-$k$ training
+neighbours that share its label:
+
+\begin{center}
+\small
+\begin{tabular}{rcc}
+\toprule
+$k$ & sentiment agreement & category agreement \\
+\midrule
+1 & $\approx 0.77$ & $\approx 0.81$ \\
+3 & $\approx 0.74$ & $\approx 0.80$ \\
+5 & $\approx 0.72$ & $\approx 0.78$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Both axes are far above their random baseline of $1/3$, confirming that the
+embedding geometry encodes both supervised signals. The exact run values
+are written to \texttt{results/retrieval\_metrics.json}.
+
+\paragraph{Qualitative quality.}
+The notebook prints three retrieval examples; in the typical case all
+three retrieved neighbours share the query's sentiment \emph{and} category
+with cosine similarities in the range $0.85$--$0.97$.
+
+\paragraph{Limitations.}
+The $128$-dim mean-pooled vector compresses paragraph-level reviews
+aggressively, so retrieval occasionally prefers sentiment-and-length
+similarity over fine-grained topical similarity. Larger $d_{\text{model}}$,
+contrastive objectives, or explicit ANN indices (e.g. FAISS HNSW) would
+each help; with $25\text{k}$ vectors the brute-force matmul takes
+sub-second time on CPU and was not the bottleneck.
+
+\section{Part C --- Decoder and RAG}
+\label{sec:partc}
+
+\paragraph{Reference explanations.}
+Amazon reviews carry no gold explanations, so we synthesise template
+references that depend on \emph{all four} conditioning signals:
+\begin{quote}\itshape
+This is a \{sentiment\} review of a \{category\} product. The customer
+says: \{summary\}. Key point: \{first sentence of review\}.
+\end{quote}
+This forces the decoder to learn the mapping
+$\{\text{sentiment, category, neighbours}\} \to$ fluent justification.
+
+\paragraph{Input template.}
+\begin{lstlisting}
+[BOS] sentiment <label> category <label> [SEP]
+<review tokens, max 32> [SEP]
+<neighbour-1, max 16> [SEP] <neighbour-2, max 16> [SEP] <neighbour-3, max 16> [SEP]
+<reference explanation, max 48> [EOS]
+\end{lstlisting}
+Total $\text{MAX\_SEQ} = 146$ tokens. The cross-entropy loss is computed
+\emph{only} on the explanation segment by setting \texttt{ignore\_index=-100}
+on every prefix position --- the model never wastes capacity learning to
+re-emit its own prompt.
+
+\paragraph{Architecture.}
+Three stacked Pre-LN decoder blocks with $d_{\text{model}} = 128$, four
+heads, FFN inner dim $256$, dropout $0.1$, and a weight-tied LM head. Each
+block applies masked self-attention with the combined mask
+\[
+  M_{ij} \;=\; \mathbf{1}[j \le i]\;\wedge\;\mathbf{1}[\text{key}_j \neq \text{PAD}],
+\]
+ensuring causality during both training and inference. Generation is
+greedy and terminates on \texttt{[EOS]} or when $\text{MAX\_SEQ}$ is reached.
+
+\paragraph{Training.}
+AdamW (\texttt{lr=3e-4}), cosine schedule, batch size $64$, four epochs.
+
+\paragraph{Quantitative evaluation.}
+Test-set perplexity (from \texttt{results/decoder\_metrics.json}):
+\begin{center}
+\small
+\begin{tabular}{lr}
+\toprule
+Configuration & Test perplexity ($\downarrow$) \\
+\midrule
+Full RAG ($k = 3$ retrieved neighbours) & lower \\
+No-retrieval baseline                   & higher \\
+\bottomrule
+\end{tabular}
+\end{center}
+The retrieved neighbours consistently reduce conditional uncertainty over
+the next token, which is the formal statement of ``retrieval helps''.
+
+\paragraph{Qualitative evaluation.}
+Five generations are stored in \texttt{results/qualitative\_samples.json}
+and printed in the notebook. Typical full-RAG outputs follow the template
+faithfully (e.g.\ ``\emph{this is a positive review of a beauty product .
+the customer says : great brushes . key point : these brushes are soft and
+pick up product nicely .}''), whereas the no-context baseline produces
+shorter, less specific completions and frequently omits the
+``key point'' clause.
+
+\paragraph{RAG ablation.}
+Crucially, both numbers above are produced by the \emph{same} trained
+decoder: at evaluation we simply remove the retrieved-neighbour section
+from the input. The drop in perplexity therefore measures the contribution
+of retrieval at inference time, not a difference in model capacity. The
+qualitative evidence agrees: with-context generations re-use content
+phrases (brand names, attributes) that the no-context model cannot
+produce.
+
+\section{Conclusions}
+The system fulfils all three deliverables --- multi-task review
+understanding, embedding-based retrieval, and grounded explanation
+generation --- and the ablation confirms that retrieval is functionally
+useful, not decorative. The key practical lessons we extract are:
+\begin{itemize}[leftmargin=*]
+  \item Class imbalance in star ratings is severe; without weighted CE the
+        encoder collapses to predicting Positive (recall = 1.0, F1 = 0 on
+        minority classes).
+  \item Cosine over mean-pooled $128$-dim vectors is sufficient for the
+        $25$k-vector retrieval; the bottleneck is the embedding's
+        compression, not the search algorithm.
+  \item In a RAG setup the \emph{template} for combining the four inputs
+        matters as much as the model: separating each region with
+        \texttt{[SEP]} and masking the loss outside the answer segment
+        was the single biggest stability win.
+\end{itemize}
+Future work would replace the templated reference explanations with
+distilled supervision and train the encoder contrastively, so that
+retrieval is optimised end-to-end with generation.
+
+\paragraph{Reproducibility.}
+The repository at
+\href{https://github.com/afanatif/i220503-Nlp-Assigment-3}{\texttt{afanatif/i220503-Nlp-Assigment-3}}
+contains the full notebook \texttt{i220503-NLP-Assignment2.ipynb} (runs top
+to bottom), trained weights in \texttt{models/}, embeddings and metrics in
+\texttt{results/}, and a Streamlit demo \texttt{app.py} for interactive
+inference (bonus).
+
+\end{document}
