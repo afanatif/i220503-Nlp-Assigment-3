@@ -49,8 +49,24 @@ import matplotlib.pyplot as plt
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
+# ---- GPU selection ----------------------------------------------------------
+# Set FORCE_GPU=False if you really want to fall back to CPU.
+FORCE_GPU = True
+if FORCE_GPU and not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA not available. Check `nvidia-smi`, that you installed the CUDA "
+        "build of torch (e.g. torch==2.6.0+cu124), and restart the kernel."
+    )
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('Device:', device)
+if device.type == 'cuda':
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.benchmark = True                # faster conv/matmul kernels
+    torch.set_float32_matmul_precision('high')           # use TF32 on Ampere/Ada
+    print(f"Device: cuda  ->  {torch.cuda.get_device_name(0)}  "
+          f"({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB, "
+          f"torch {torch.__version__})")
+else:
+    print('Device: cpu  (no CUDA detected)')
 
 os.makedirs('models', exist_ok=True)
 os.makedirs('results', exist_ok=True)
@@ -61,13 +77,13 @@ CFG = dict(
     max_len         = 64,
     min_freq        = 3,
     vocab_max       = 20000,
-    batch_size      = 128,
+    batch_size      = 256,
     enc_d_model     = 128,
     enc_heads       = 4,
     enc_layers      = 4,
     enc_ff          = 256,
     enc_dropout     = 0.1,
-    enc_epochs      = 4,
+    enc_epochs      = 6,
     enc_lr          = 3e-4,
     dec_d_model     = 128,
     dec_heads       = 4,
@@ -81,7 +97,6 @@ CFG = dict(
 )
 print(json.dumps(CFG, indent=2))
 """)
-
 
 # ---------------------------------------------------------------------------
 md("## 1. Load data\n\nWe sample roughly equal numbers of reviews from three categories so that the classification task is balanced across categories. Each sample retains the raw review text, summary, star rating, and category label.")
@@ -116,7 +131,6 @@ for cat in CFG['categories']:
 print('Total:', len(raw))
 random.shuffle(raw)
 """)
-
 
 # ---------------------------------------------------------------------------
 md("""## 2. Preprocessing
@@ -216,7 +230,6 @@ val_loader   = DataLoader(val_ds,   batch_size=CFG['batch_size'])
 test_loader  = DataLoader(test_ds,  batch_size=CFG['batch_size'])
 print('batches:', len(train_loader), len(val_loader), len(test_loader))
 """)
-
 
 # ---------------------------------------------------------------------------
 md("""## Part A — Encoder-only Transformer (multi-task)
@@ -333,6 +346,13 @@ code(r"""# ---- Training Part A ----
 opt = torch.optim.AdamW(encoder.parameters(), lr=CFG['enc_lr'], weight_decay=1e-4)
 sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG['enc_epochs']*len(train_loader))
 
+# Class-balanced weights for sentiment: dataset is heavily skewed to Positive.
+# Without these the model collapses to "always Positive" (~79% accuracy, 0 recall on minority classes).
+sent_counts = np.bincount([r['sentiment'] for r in train], minlength=3).astype(np.float32)
+sent_weights = torch.tensor(sent_counts.sum() / (3 * sent_counts), device=device, dtype=torch.float32)
+print('Sentiment class counts :', sent_counts.tolist())
+print('Sentiment class weights:', sent_weights.tolist())
+
 LAMBDA = 0.5
 hist = {'train_loss':[], 'val_loss':[], 'val_sent_acc':[], 'val_cat_acc':[]}
 
@@ -343,7 +363,8 @@ def run_epoch(loader, train_mode):
         ids, mask, ys, yc = ids.to(device), mask.to(device), ys.to(device), yc.to(device)
         with torch.set_grad_enabled(train_mode):
             ls, lc, _ = encoder(ids, mask)
-            loss = F.cross_entropy(ls, ys) + LAMBDA * F.cross_entropy(lc, yc)
+            loss = (F.cross_entropy(ls, ys, weight=sent_weights)
+                    + LAMBDA * F.cross_entropy(lc, yc))
             if train_mode:
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
@@ -403,7 +424,6 @@ with open('results/encoder_metrics.json', 'w') as f:
                               target_names=CFG['categories'], digits=3, output_dict=True),
     }, f, indent=2)
 """)
-
 
 # ---------------------------------------------------------------------------
 md("## Part B — Retrieval module\n\nWe compute and store an embedding for every *training* review (the encoder's mean-pooled output) so that any test query can be matched against the entire training corpus by cosine similarity.")
@@ -467,7 +487,6 @@ with open('results/retrieval_metrics.json','w') as f:
     json.dump({'k': K, 'sentiment_agreement': float(agree_sent),
                'category_agreement': float(agree_cat)}, f, indent=2)
 """)
-
 
 # ---------------------------------------------------------------------------
 md("""## Part C — Decoder-only Transformer (RAG generation)
@@ -693,7 +712,6 @@ with open('results/qualitative_samples.json','w') as f:
     json.dump(qual, f, indent=2)
 """)
 
-
 # ---------------------------------------------------------------------------
 md("""## Summary of results
 
@@ -714,7 +732,6 @@ The notebook saves:
 
 Discussion, hyper-parameter log and ablation analysis are in `report.md`.
 """)
-
 
 # ---------------------------------------------------------------------------
 nb = {
