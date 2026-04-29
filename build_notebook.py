@@ -218,6 +218,193 @@ print('batches:', len(train_loader), len(val_loader), len(test_loader))
 """)
 
 
+# ---------------------------------------------------------------------------
+md("""## Part A — Encoder-only Transformer (multi-task)
+
+### Derived feature
+We use **product category prediction** (beauty / cellphones / sports) as the second task. Motivation:
+- It is *predictable from text alone* — vocabulary is genre-specific.
+- It is *meaningful* — the same star rating means very different things across categories, so a category-aware embedding is more useful for retrieval and generation.
+- It is *non-trivially correlated with sentiment but not redundant with it*.
+
+### Architecture (from scratch)
+* Token embedding + sinusoidal positional encoding.
+* `enc_layers` × `EncoderBlock`(Pre-LN: `LN → MHA → res → LN → FFN → res`).
+* Pooled review vector = mean of token states under the attention mask.
+* Two linear heads (sentiment 3-way, category 3-way).
+
+The combined loss is `L = L_sent + λ·L_cat` with `λ = 0.5` to slightly down-weight the easier task.
+""")
+
+code(r"""class PositionalEncoding(nn.Module):
+    def __init__(self, d, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000.0)/d))
+        pe[:, 0::2] = torch.sin(pos*div); pe[:, 1::2] = torch.cos(pos*div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d, h, drop=0.0):
+        super().__init__()
+        assert d % h == 0
+        self.h, self.dk = h, d // h
+        self.q = nn.Linear(d, d); self.k = nn.Linear(d, d); self.v = nn.Linear(d, d)
+        self.o = nn.Linear(d, d); self.drop = nn.Dropout(drop)
+    def forward(self, q, k, v, mask=None):
+        B,Tq,_ = q.shape; Tk = k.size(1)
+        Q = self.q(q).view(B, Tq, self.h, self.dk).transpose(1,2)   # (B,h,Tq,dk)
+        K = self.k(k).view(B, Tk, self.h, self.dk).transpose(1,2)
+        V = self.v(v).view(B, Tk, self.h, self.dk).transpose(1,2)
+        scores = (Q @ K.transpose(-2,-1)) / math.sqrt(self.dk)      # (B,h,Tq,Tk)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+        out  = attn @ V                                             # (B,h,Tq,dk)
+        out  = out.transpose(1,2).contiguous().view(B, Tq, self.h*self.dk)
+        return self.o(out), attn
+
+class FeedForward(nn.Module):
+    def __init__(self, d, ff, drop=0.0):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d,ff), nn.GELU(),
+                                 nn.Dropout(drop), nn.Linear(ff,d))
+    def forward(self, x): return self.net(x)
+
+class EncoderBlock(nn.Module):
+    def __init__(self, d, h, ff, drop):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d); self.attn = MultiHeadAttention(d,h,drop)
+        self.ln2 = nn.LayerNorm(d); self.ffn  = FeedForward(d,ff,drop)
+        self.drop = nn.Dropout(drop)
+    def forward(self, x, mask):
+        h = self.ln1(x)
+        a,_ = self.attn(h,h,h,mask)
+        x = x + self.drop(a)
+        x = x + self.drop(self.ffn(self.ln2(x)))
+        return x
+
+class ReviewEncoder(nn.Module):
+    def __init__(self, V, d, h, L, ff, drop, max_len, n_sent=3, n_cat=3):
+        super().__init__()
+        self.tok = nn.Embedding(V, d, padding_idx=PAD_ID)
+        self.pos = PositionalEncoding(d, max_len)
+        self.drop = nn.Dropout(drop)
+        self.blocks = nn.ModuleList([EncoderBlock(d,h,ff,drop) for _ in range(L)])
+        self.ln = nn.LayerNorm(d)
+        self.head_sent = nn.Linear(d, n_sent)
+        self.head_cat  = nn.Linear(d, n_cat)
+    def encode(self, ids, mask):
+        x = self.drop(self.pos(self.tok(ids)))
+        # mask shape for MHA: (B,1,1,T)
+        m = mask[:, None, None, :]
+        for blk in self.blocks: x = blk(x, m)
+        x = self.ln(x)
+        # masked mean pool
+        mf = mask.unsqueeze(-1).float()
+        pooled = (x * mf).sum(1) / mf.sum(1).clamp(min=1)
+        return pooled, x
+    def forward(self, ids, mask):
+        pooled, _ = self.encode(ids, mask)
+        return self.head_sent(pooled), self.head_cat(pooled), pooled
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.normal_(m.weight, std=0.02)
+        if m.bias is not None: nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Embedding):
+        nn.init.normal_(m.weight, std=0.02)
+        if m.padding_idx is not None:
+            with torch.no_grad(): m.weight[m.padding_idx].zero_()
+
+V = len(itos)
+encoder = ReviewEncoder(V, CFG['enc_d_model'], CFG['enc_heads'], CFG['enc_layers'],
+                        CFG['enc_ff'], CFG['enc_dropout'], CFG['max_len']).to(device)
+encoder.apply(init_weights)
+n_params = sum(p.numel() for p in encoder.parameters())
+print(f"Encoder params: {n_params/1e6:.2f}M")
+""")
+
+code(r"""# ---- Training Part A ----
+opt = torch.optim.AdamW(encoder.parameters(), lr=CFG['enc_lr'], weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG['enc_epochs']*len(train_loader))
+
+LAMBDA = 0.5
+hist = {'train_loss':[], 'val_loss':[], 'val_sent_acc':[], 'val_cat_acc':[]}
+
+def run_epoch(loader, train_mode):
+    encoder.train(train_mode)
+    tot, ns, nc, n = 0., 0, 0, 0
+    for ids, mask, ys, yc in loader:
+        ids, mask, ys, yc = ids.to(device), mask.to(device), ys.to(device), yc.to(device)
+        with torch.set_grad_enabled(train_mode):
+            ls, lc, _ = encoder(ids, mask)
+            loss = F.cross_entropy(ls, ys) + LAMBDA * F.cross_entropy(lc, yc)
+            if train_mode:
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                opt.step(); sched.step()
+        tot += loss.item() * ids.size(0)
+        ns  += (ls.argmax(-1)==ys).sum().item()
+        nc  += (lc.argmax(-1)==yc).sum().item()
+        n   += ids.size(0)
+    return tot/n, ns/n, nc/n
+
+t0 = time.time()
+for ep in range(CFG['enc_epochs']):
+    tr_loss,_,_ = run_epoch(train_loader, True)
+    va_loss, sa, ca = run_epoch(val_loader, False)
+    hist['train_loss'].append(tr_loss); hist['val_loss'].append(va_loss)
+    hist['val_sent_acc'].append(sa);    hist['val_cat_acc'].append(ca)
+    print(f"epoch {ep+1}/{CFG['enc_epochs']}  train_loss={tr_loss:.4f}  "
+          f"val_loss={va_loss:.4f}  sent_acc={sa:.3f}  cat_acc={ca:.3f}")
+print(f"Encoder training done in {time.time()-t0:.1f}s")
+
+torch.save(encoder.state_dict(), 'models/encoder.pt')
+""")
+
+code(r"""# Learning curves
+fig, ax = plt.subplots(1,2, figsize=(10,3.5))
+ax[0].plot(hist['train_loss'], label='train'); ax[0].plot(hist['val_loss'], label='val')
+ax[0].set_title('Encoder loss'); ax[0].set_xlabel('epoch'); ax[0].legend()
+ax[1].plot(hist['val_sent_acc'], label='sentiment')
+ax[1].plot(hist['val_cat_acc'],  label='category')
+ax[1].set_title('Validation accuracy'); ax[1].set_xlabel('epoch'); ax[1].legend()
+plt.tight_layout(); plt.savefig('results/encoder_curves.png', dpi=120); plt.show()
+""")
+
+code(r"""# ---- Test-set evaluation Part A ----
+from sklearn.metrics import classification_report, confusion_matrix
+encoder.eval()
+all_ys, all_ps_s, all_yc, all_ps_c = [], [], [], []
+with torch.no_grad():
+    for ids, mask, ys, yc in test_loader:
+        ids, mask = ids.to(device), mask.to(device)
+        ls, lc, _ = encoder(ids, mask)
+        all_ys.extend(ys.tolist()); all_ps_s.extend(ls.argmax(-1).cpu().tolist())
+        all_yc.extend(yc.tolist()); all_ps_c.extend(lc.argmax(-1).cpu().tolist())
+
+print('=== Sentiment (test) ===')
+print(classification_report(all_ys, all_ps_s, target_names=SENT_NAMES, digits=3))
+print('=== Category (test) ===')
+print(classification_report(all_yc, all_ps_c, target_names=CFG['categories'], digits=3))
+
+# save metrics
+with open('results/encoder_metrics.json', 'w') as f:
+    json.dump({
+        'history': hist,
+        'sentiment_report': classification_report(all_ys, all_ps_s,
+                              target_names=SENT_NAMES, digits=3, output_dict=True),
+        'category_report':  classification_report(all_yc, all_ps_c,
+                              target_names=CFG['categories'], digits=3, output_dict=True),
+    }, f, indent=2)
+""")
+
+
 
 # ---------------------------------------------------------------------------
 nb = {
