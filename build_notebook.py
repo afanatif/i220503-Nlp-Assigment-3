@@ -405,6 +405,70 @@ with open('results/encoder_metrics.json', 'w') as f:
 """)
 
 
+# ---------------------------------------------------------------------------
+md("## Part B — Retrieval module\n\nWe compute and store an embedding for every *training* review (the encoder's mean-pooled output) so that any test query can be matched against the entire training corpus by cosine similarity.")
+
+code(r"""@torch.no_grad()
+def embed_dataset(rows, batch_size=256):
+    encoder.eval()
+    embs = []
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i+batch_size]
+        ids   = torch.tensor([encode(r['tokens'], CFG['max_len']) for r in batch], device=device)
+        mask  = (ids != PAD_ID).long()
+        _,_, pooled = encoder(ids, mask)
+        embs.append(F.normalize(pooled, dim=-1).cpu())
+    return torch.cat(embs, 0)
+
+train_emb = embed_dataset(train)
+test_emb  = embed_dataset(test)
+print('train_emb', train_emb.shape, ' test_emb', test_emb.shape)
+
+torch.save(train_emb, 'results/train_embeddings.pt')
+torch.save(test_emb,  'results/test_embeddings.pt')
+with open('results/train_meta.pkl','wb') as f:
+    pickle.dump([{k:r[k] for k in ('text','rating','category','sentiment','cat_id')} for r in train], f)
+""")
+
+code(r"""def retrieve(query_vec, k=CFG['top_k']):
+    # cosine sim — both sides L2-normalised
+    sims = query_vec @ train_emb.T            # (B, N_train)
+    topv, topi = sims.topk(k, dim=-1)
+    return topv, topi
+
+# ---- Qualitative retrieval examples ----
+sample_idx = random.sample(range(len(test)), 3)
+for si in sample_idx:
+    q = test_emb[si:si+1]
+    sims, idx = retrieve(q, k=CFG['top_k'])
+    print('='*80)
+    print('QUERY  ({}, rating={}): {}'.format(
+        test[si]['category'], test[si]['rating'], test[si]['text'][:200]))
+    for rank,(s,j) in enumerate(zip(sims[0].tolist(), idx[0].tolist())):
+        print(f"  #{rank+1}  sim={s:.3f}  cat={train[j]['category']}  rating={train[j]['rating']}  "
+              f"-> {train[j]['text'][:160]}")
+""")
+
+code(r"""# Quantitative retrieval check: do top-k neighbours agree with query labels?
+K = CFG['top_k']
+sims_all, idx_all = retrieve(test_emb, k=K)
+agree_sent = 0; agree_cat = 0
+test_sent = np.array([r['sentiment'] for r in test])
+test_cat  = np.array([r['cat_id']    for r in test])
+train_sent= np.array([r['sentiment'] for r in train])
+train_cat = np.array([r['cat_id']    for r in train])
+for i in range(len(test)):
+    nn_idx = idx_all[i].numpy()
+    agree_sent += (train_sent[nn_idx] == test_sent[i]).mean()
+    agree_cat  += (train_cat [nn_idx] == test_cat [i]).mean()
+agree_sent /= len(test); agree_cat /= len(test)
+print(f"Mean top-{K} label agreement  sentiment={agree_sent:.3f}  category={agree_cat:.3f}")
+with open('results/retrieval_metrics.json','w') as f:
+    json.dump({'k': K, 'sentiment_agreement': float(agree_sent),
+               'category_agreement': float(agree_cat)}, f, indent=2)
+""")
+
+
 
 # ---------------------------------------------------------------------------
 nb = {
