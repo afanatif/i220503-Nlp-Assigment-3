@@ -713,6 +713,171 @@ with open('results/qualitative_samples.json','w') as f:
 """)
 
 # ---------------------------------------------------------------------------
+md("""## Bonus — Streamlit demo UI
+
+Running the cell below writes a self-contained `app.py` next to the notebook. After the notebook has finished training (so `models/` and `results/` are populated), launch the demo with:
+
+```powershell
+pip install streamlit
+streamlit run app.py
+```
+
+The UI lets a user paste a review and shows: predicted sentiment, predicted product category, top-3 retrieved similar training reviews, and the generated RAG explanation.""")
+
+code(r'''APP = r"""
+import os, json, math, pickle, re
+import torch, torch.nn as nn, torch.nn.functional as F
+import streamlit as st
+
+st.set_page_config(page_title="Review RAG demo", page_icon="ud83dudcdd", layout="wide")
+st.title("Amazon Review Understanding + RAG Explanation")
+st.caption("CS-4063 NLP Assignment 3 — i22-0503")
+
+# --- load artefacts ---------------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+with open("results/vocab.pkl","rb") as f:
+    voc = pickle.load(f); itos, stoi = voc["itos"], voc["stoi"]
+PAD_ID,UNK_ID,BOS_ID,EOS_ID,SEP_ID = (stoi[t] for t in ["<pad>","<unk>","<bos>","<eos>","<sep>"])
+V = len(itos); MAX_LEN = 64; D = 128
+SENT = ["Negative","Neutral","Positive"]; CATS = ["beauty","cellphones","sports"]
+
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+TOK_RE = re.compile(r"[a-z]+(?:\u0027[a-z]+)?|<num>|<url>|[!?.]")
+def tokenize(s):
+    s = URL_RE.sub(" <url> ", re.sub(r"\d+"," <num> ", s.lower()))
+    return TOK_RE.findall(s)
+def encode(toks, n):
+    ids=[stoi.get(t,UNK_ID) for t in toks][:n]; ids+=[PAD_ID]*(n-len(ids)); return ids
+
+# --- model defs (must match the notebook) -----------------------------------
+class PE(nn.Module):
+    def __init__(self,d,n=512):
+        super().__init__(); pe=torch.zeros(n,d); p=torch.arange(n).unsqueeze(1).float()
+        div=torch.exp(torch.arange(0,d,2).float()*(-math.log(10000.0)/d))
+        pe[:,0::2]=torch.sin(p*div); pe[:,1::2]=torch.cos(p*div)
+        self.register_buffer("pe",pe.unsqueeze(0))
+    def forward(self,x): return x+self.pe[:,:x.size(1)]
+class MHA(nn.Module):
+    def __init__(self,d,h):
+        super().__init__(); self.h,self.dk=h,d//h
+        self.q=nn.Linear(d,d); self.k=nn.Linear(d,d); self.v=nn.Linear(d,d); self.o=nn.Linear(d,d)
+    def forward(self,q,k,v,m=None):
+        B,Tq,_=q.shape; Tk=k.size(1)
+        Q=self.q(q).view(B,Tq,self.h,self.dk).transpose(1,2)
+        K=self.k(k).view(B,Tk,self.h,self.dk).transpose(1,2)
+        V=self.v(v).view(B,Tk,self.h,self.dk).transpose(1,2)
+        s=(Q@K.transpose(-2,-1))/math.sqrt(self.dk)
+        if m is not None: s=s.masked_fill(m==0,float("-inf"))
+        a=F.softmax(s,-1); o=(a@V).transpose(1,2).contiguous().view(B,Tq,-1)
+        return self.o(o)
+class FF(nn.Module):
+    def __init__(self,d,ff):
+        super().__init__(); self.n=nn.Sequential(nn.Linear(d,ff),nn.GELU(),nn.Linear(ff,d))
+    def forward(self,x): return self.n(x)
+class EBlk(nn.Module):
+    def __init__(self,d,h,ff):
+        super().__init__(); self.l1=nn.LayerNorm(d); self.a=MHA(d,h); self.l2=nn.LayerNorm(d); self.f=FF(d,ff)
+    def forward(self,x,m): x=x+self.a(self.l1(x),self.l1(x),self.l1(x),m); return x+self.f(self.l2(x))
+class DBlk(nn.Module):
+    def __init__(self,d,h,ff):
+        super().__init__(); self.l1=nn.LayerNorm(d); self.a=MHA(d,h); self.l2=nn.LayerNorm(d); self.f=FF(d,ff)
+    def forward(self,x,c,kp): x=x+self.a(self.l1(x),self.l1(x),self.l1(x),c&kp); return x+self.f(self.l2(x))
+
+class Enc(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tok=nn.Embedding(V,D,padding_idx=PAD_ID); self.pos=PE(D,MAX_LEN)
+        self.blocks=nn.ModuleList([EBlk(D,4,256) for _ in range(4)])
+        self.ln=nn.LayerNorm(D); self.hs=nn.Linear(D,3); self.hc=nn.Linear(D,3)
+    def forward(self,ids,mask):
+        x=self.pos(self.tok(ids)); m=mask[:,None,None,:]
+        for b in self.blocks: x=b(x,m)
+        x=self.ln(x); mf=mask.unsqueeze(-1).float()
+        p=(x*mf).sum(1)/mf.sum(1).clamp(min=1)
+        return self.hs(p), self.hc(p), p
+
+class Dec(nn.Module):
+    def __init__(self,seq):
+        super().__init__()
+        self.tok=nn.Embedding(V,D,padding_idx=PAD_ID); self.pos=PE(D,seq+8)
+        self.blocks=nn.ModuleList([DBlk(D,4,256) for _ in range(3)])
+        self.ln=nn.LayerNorm(D); self.lm=nn.Linear(D,V,bias=False); self.lm.weight=self.tok.weight
+    def forward(self,ids):
+        T=ids.size(1); x=self.pos(self.tok(ids))
+        c=torch.tril(torch.ones(T,T,device=ids.device,dtype=torch.bool))[None,None]
+        kp=(ids!=PAD_ID)[:,None,None,:]
+        for b in self.blocks: x=b(x,c,kp)
+        return self.lm(self.ln(x))
+
+@st.cache_resource
+def load_all():
+    enc = Enc().to(device); enc.load_state_dict(torch.load("models/encoder.pt", map_location=device)); enc.eval()
+    train_emb = torch.load("results/train_embeddings.pt", map_location="cpu")
+    with open("results/train_meta.pkl","rb") as f: meta = pickle.load(f)
+    # decoder MAX_SEQ matches notebook config
+    NEI_LEN, REV_LEN, EXP_LEN, K = 16, 32, 48, 3
+    MAX_SEQ = 8 + 2 + REV_LEN + 1 + (NEI_LEN+1)*K + EXP_LEN + 4
+    dec = Dec(MAX_SEQ).to(device); dec.load_state_dict(torch.load("models/decoder.pt", map_location=device)); dec.eval()
+    return enc, dec, train_emb, meta, MAX_SEQ, NEI_LEN, REV_LEN, EXP_LEN, K
+
+enc, dec, train_emb, meta, MAX_SEQ, NEI_LEN, REV_LEN, EXP_LEN, K = load_all()
+
+@torch.no_grad()
+def predict(text):
+    ids=torch.tensor([encode(tokenize(text), MAX_LEN)], device=device); mask=(ids!=PAD_ID).long()
+    ls,lc,vec = enc(ids,mask)
+    return SENT[ls.argmax(-1).item()], CATS[lc.argmax(-1).item()], F.normalize(vec,-1).cpu()
+
+@torch.no_grad()
+def topk(qvec, k=K):
+    sims = (qvec @ train_emb.T).squeeze(0)
+    v,i = sims.topk(k); return v.tolist(), i.tolist()
+
+@torch.no_grad()
+def generate(text, sent, cat, neighbours, with_ctx=True, max_new=40):
+    def tids(s,n): return [stoi.get(t,UNK_ID) for t in tokenize(s)][:n]
+    header=[BOS_ID]+tids(f"sentiment {sent.lower()} category {cat}",8)+[SEP_ID]+tids(text,REV_LEN)+[SEP_ID]
+    if with_ctx:
+        for nb in neighbours: header += tids(nb["text"],NEI_LEN)+[SEP_ID]
+    ids=torch.tensor([header],device=device); out=[]
+    for _ in range(max_new):
+        nxt=int(dec(ids)[:,-1,:].argmax(-1).item())
+        if nxt==EOS_ID: break
+        out.append(nxt); ids=torch.cat([ids,torch.tensor([[nxt]],device=device)],1)
+        if ids.size(1)>=MAX_SEQ-1: break
+    return " ".join(itos[i] for i in out)
+
+# --- UI ---------------------------------------------------------------------
+default = "These shoes were super comfortable on my morning runs but the laces frayed within a week."
+text = st.text_area("Paste a product review", value=default, height=140)
+k    = st.slider("Top-k retrieved neighbours", 1, 5, K)
+ablation = st.checkbox("Show no-retrieval baseline alongside", value=True)
+
+if st.button("Analyse", type="primary") and text.strip():
+    sent, cat, qvec = predict(text)
+    sims, idx = topk(qvec, k)
+    nbs = [meta[i] for i in idx]
+
+    c1,c2 = st.columns(2)
+    c1.metric("Predicted sentiment", sent); c2.metric("Predicted category", cat)
+
+    st.subheader(f"Top-{k} retrieved training reviews")
+    for s,nb in zip(sims, nbs):
+        st.markdown(f"**sim {s:.3f}** · *{nb['category']}* · rating={nb['rating']}\n\n> {nb['text'][:300]}")
+
+    st.subheader("Generated explanation (RAG)")
+    st.success(generate(text, sent, cat, nbs, with_ctx=True))
+    if ablation:
+        st.subheader("Baseline (no retrieval)")
+        st.info(generate(text, sent, cat, [], with_ctx=False))
+"""
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(APP)
+print("Wrote app.py — run with:  streamlit run app.py")
+''')
+
+# ---------------------------------------------------------------------------
 md("""## Summary of results
 
 The notebook saves:
