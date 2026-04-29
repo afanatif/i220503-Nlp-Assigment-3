@@ -469,6 +469,252 @@ with open('results/retrieval_metrics.json','w') as f:
 """)
 
 
+# ---------------------------------------------------------------------------
+md("""## Part C — Decoder-only Transformer (RAG generation)
+
+### Reference explanations
+The Amazon reviews do not come with gold explanations, so we construct **template references** that the decoder learns to imitate:
+
+> *"This is a {sentiment} review of a {category} product. The customer says: {summary}. Key point: {first_sentence}."*
+
+These references provide a consistent training signal that ties together all four conditioning inputs.
+
+### Input template fed to the decoder
+```
+[BOS] sentiment=<label> category=<label> [SEP] <review tokens>
+[SEP] ctx <neighbour-1 short> [SEP] <neighbour-2 short> [SEP] ... [SEP]
+<reference explanation> [EOS]
+```
+Loss is only computed on the **explanation** part of the sequence (everything before is masked out).
+
+### Architecture
+Pre-LN decoder block: `LN → masked self-attention → res → LN → FFN → res`. A causal mask of shape `(T, T)` ensures position *t* only attends to positions `≤ t`.
+""")
+
+code(r"""def first_sentence(s, max_words=18):
+    s = re.split(r'(?<=[.!?])\s+', s.strip())[0]
+    w = s.split()
+    return ' '.join(w[:max_words])
+
+def make_reference(r):
+    return (f"this is a {SENT_NAMES[r['sentiment']].lower()} review of a "
+            f"{r['category']} product . the customer says : {first_sentence(r['summary'] or r['text'])} . "
+            f"key point : {first_sentence(r['text'])} .")
+
+# tokens for special structural strings — keep simple, reuse vocab
+def tok_ids(s, max_len):
+    return [stoi.get(t, UNK_ID) for t in tokenize(s)][:max_len]
+
+NEI_LEN  = 16     # tokens kept per retrieved neighbour
+REV_LEN  = 32     # tokens kept from the source review
+EXP_LEN  = CFG['dec_max_len']
+
+def build_sequence(row, neighbours, with_ctx=True):
+    sent_lbl = SENT_NAMES[row['sentiment']].lower()
+    cat_lbl  = row['category']
+    header = ([BOS_ID] + tok_ids(f"sentiment {sent_lbl} category {cat_lbl}", 8)
+              + [SEP_ID] + tok_ids(row['text'], REV_LEN) + [SEP_ID])
+    if with_ctx and neighbours:
+        ctx = []
+        for nb in neighbours:
+            ctx += tok_ids(nb['text'], NEI_LEN) + [SEP_ID]
+        header += ctx
+    ref_ids = tok_ids(make_reference(row), EXP_LEN) + [EOS_ID]
+    seq     = header + ref_ids
+    label   = [-100]*len(header) + ref_ids                  # -100 ignored by CE
+    return seq, label
+
+# pre-compute neighbour indices for every train and test row
+print('Computing train embeddings for neighbour lookup (already cached) ...')
+train_nei_idx = retrieve(train_emb, k=CFG['top_k']+1)[1][:, 1:]    # drop self
+test_nei_idx  = idx_all                                            # from Part B
+
+MAX_SEQ = 8 + 2 + REV_LEN + 1 + (NEI_LEN+1)*CFG['top_k'] + EXP_LEN + 4
+print('Decoder MAX_SEQ =', MAX_SEQ)
+""")
+
+code(r"""class GenDS(Dataset):
+    def __init__(self, rows, nei_idx, with_ctx=True):
+        self.rows, self.nei_idx, self.with_ctx = rows, nei_idx, with_ctx
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, i):
+        r = self.rows[i]
+        nbs = [train[j] for j in self.nei_idx[i].tolist()] if self.with_ctx else []
+        seq, lab = build_sequence(r, nbs, with_ctx=self.with_ctx)
+        seq = seq[:MAX_SEQ]; lab = lab[:MAX_SEQ]
+        pad = MAX_SEQ - len(seq)
+        seq += [PAD_ID]*pad; lab += [-100]*pad
+        return torch.tensor(seq), torch.tensor(lab)
+
+train_gen = GenDS(train, train_nei_idx, with_ctx=True)
+test_gen  = GenDS(test,  test_nei_idx,  with_ctx=True)
+test_gen_noctx = GenDS(test, test_nei_idx, with_ctx=False)
+
+train_gen_loader = DataLoader(train_gen, batch_size=64, shuffle=True)
+test_gen_loader  = DataLoader(test_gen,  batch_size=64)
+test_noctx_loader= DataLoader(test_gen_noctx, batch_size=64)
+print('Decoder training batches:', len(train_gen_loader))
+""")
+
+code(r"""class DecoderBlock(nn.Module):
+    def __init__(self, d, h, ff, drop):
+        super().__init__()
+        self.ln1=nn.LayerNorm(d); self.attn=MultiHeadAttention(d,h,drop)
+        self.ln2=nn.LayerNorm(d); self.ffn=FeedForward(d,ff,drop)
+        self.drop=nn.Dropout(drop)
+    def forward(self, x, causal_mask, key_pad_mask):
+        h = self.ln1(x)
+        # combine causal mask (1,1,T,T) with key pad mask (B,1,1,T)
+        m = causal_mask & key_pad_mask
+        a,_ = self.attn(h,h,h,m)
+        x = x + self.drop(a)
+        x = x + self.drop(self.ffn(self.ln2(x)))
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, V, d, h, L, ff, drop, max_len):
+        super().__init__()
+        self.tok = nn.Embedding(V, d, padding_idx=PAD_ID)
+        self.pos = PositionalEncoding(d, max_len+8)
+        self.drop= nn.Dropout(drop)
+        self.blocks = nn.ModuleList([DecoderBlock(d,h,ff,drop) for _ in range(L)])
+        self.ln = nn.LayerNorm(d)
+        self.lm = nn.Linear(d, V, bias=False)
+        self.lm.weight = self.tok.weight                    # weight tying
+    def forward(self, ids):
+        B,T = ids.shape
+        x = self.drop(self.pos(self.tok(ids)))
+        causal = torch.tril(torch.ones(T,T, device=ids.device, dtype=torch.bool))[None,None]
+        keypad = (ids != PAD_ID)[:, None, None, :]
+        for blk in self.blocks: x = blk(x, causal, keypad)
+        return self.lm(self.ln(x))
+
+decoder = Decoder(V, CFG['dec_d_model'], CFG['dec_heads'], CFG['dec_layers'],
+                  CFG['dec_ff'], CFG['dec_dropout'], MAX_SEQ).to(device)
+decoder.apply(init_weights)
+decoder.lm.weight = decoder.tok.weight                      # re-tie after init
+print('Decoder params:', sum(p.numel() for p in decoder.parameters())/1e6, 'M')
+""")
+
+code(r"""# ---- Train decoder ----
+opt2 = torch.optim.AdamW(decoder.parameters(), lr=CFG['dec_lr'], weight_decay=1e-4)
+sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=CFG['dec_epochs']*len(train_gen_loader))
+
+dec_hist = {'train_loss':[], 'train_ppl':[]}
+t0 = time.time()
+for ep in range(CFG['dec_epochs']):
+    decoder.train()
+    tot, ntok = 0., 0
+    for x, y in train_gen_loader:
+        x, y = x.to(device), y.to(device)
+        logits = decoder(x[:, :-1])
+        target = y[:, 1:]
+        loss = F.cross_entropy(logits.reshape(-1, V), target.reshape(-1), ignore_index=-100)
+        opt2.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+        opt2.step(); sched2.step()
+        ntok_b = (target != -100).sum().item()
+        tot += loss.item() * ntok_b; ntok += ntok_b
+    avg = tot / max(ntok,1)
+    dec_hist['train_loss'].append(avg); dec_hist['train_ppl'].append(math.exp(avg))
+    print(f"dec epoch {ep+1}/{CFG['dec_epochs']}  loss={avg:.4f}  ppl={math.exp(avg):.2f}")
+print(f"Decoder training done in {time.time()-t0:.1f}s")
+torch.save(decoder.state_dict(), 'models/decoder.pt')
+""")
+
+code(r"""# ---- Perplexity on test set: full-RAG vs no-context ablation ----
+@torch.no_grad()
+def perplexity(loader):
+    decoder.eval(); tot=0.; ntok=0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        logits = decoder(x[:, :-1])
+        target = y[:, 1:]
+        loss = F.cross_entropy(logits.reshape(-1,V), target.reshape(-1),
+                               ignore_index=-100, reduction='sum')
+        tot += loss.item(); ntok += (target!=-100).sum().item()
+    return math.exp(tot / max(ntok,1))
+
+ppl_full   = perplexity(test_gen_loader)
+ppl_noctx  = perplexity(test_noctx_loader)
+print(f"Test perplexity  full-RAG = {ppl_full:.2f}   no-context = {ppl_noctx:.2f}")
+
+with open('results/decoder_metrics.json','w') as f:
+    json.dump({'history': dec_hist, 'ppl_full': ppl_full, 'ppl_noctx': ppl_noctx,
+               'top_k': CFG['top_k']}, f, indent=2)
+
+plt.figure(figsize=(5,3.5))
+plt.plot(dec_hist['train_loss']); plt.title('Decoder train loss'); plt.xlabel('epoch')
+plt.tight_layout(); plt.savefig('results/decoder_loss.png', dpi=120); plt.show()
+""")
+
+code(r"""# ---- Greedy generation utility ----
+@torch.no_grad()
+def generate(row, with_ctx=True, max_new=40, temperature=1.0):
+    decoder.eval()
+    nbs = [train[j] for j in test_nei_idx[row['_idx']].tolist()] if with_ctx else []
+    # Build prefix without the explanation section
+    sent_lbl = SENT_NAMES[row['sentiment']].lower()
+    cat_lbl  = row['category']
+    header = ([BOS_ID] + tok_ids(f"sentiment {sent_lbl} category {cat_lbl}", 8)
+              + [SEP_ID] + tok_ids(row['text'], REV_LEN) + [SEP_ID])
+    if with_ctx and nbs:
+        for nb in nbs:
+            header += tok_ids(nb['text'], NEI_LEN) + [SEP_ID]
+    ids = torch.tensor([header], device=device)
+    out = []
+    for _ in range(max_new):
+        logits = decoder(ids)[:, -1, :] / temperature
+        nxt = int(logits.argmax(-1).item())
+        if nxt == EOS_ID: break
+        out.append(nxt)
+        ids = torch.cat([ids, torch.tensor([[nxt]], device=device)], 1)
+        if ids.size(1) >= MAX_SEQ-1: break
+    return ' '.join(itos[i] for i in out)
+
+# attach idx for convenience
+for i,r in enumerate(test): r['_idx']=i
+
+print('=== Qualitative samples (full RAG vs no-context) ===\n')
+qual = []
+for si in random.sample(range(len(test)), 5):
+    r = test[si]
+    g_full = generate(r, with_ctx=True)
+    g_no   = generate(r, with_ctx=False)
+    print('-'*80)
+    print(f"REVIEW   ({r['category']}, rating={r['rating']}): {r['text'][:200]}")
+    print(f"PRED sentiment = {SENT_NAMES[r['sentiment']]}  category = {r['category']}")
+    print(f"FULL-RAG : {g_full}")
+    print(f"NO-CTX   : {g_no}")
+    qual.append({'review': r['text'][:300], 'rating': r['rating'],
+                 'sentiment': SENT_NAMES[r['sentiment']], 'category': r['category'],
+                 'full_rag': g_full, 'no_ctx': g_no})
+with open('results/qualitative_samples.json','w') as f:
+    json.dump(qual, f, indent=2)
+""")
+
+
+# ---------------------------------------------------------------------------
+md("""## Summary of results
+
+The notebook saves:
+
+| Path | Contents |
+|---|---|
+| `models/encoder.pt` | trained encoder weights |
+| `models/decoder.pt` | trained decoder weights |
+| `results/vocab.pkl` | vocabulary built on training data |
+| `results/train_embeddings.pt` | encoder embeddings for **all training reviews** (Part B index) |
+| `results/test_embeddings.pt`  | encoder embeddings for the test set |
+| `results/encoder_metrics.json` | learning curves + per-class P/R/F1 for both tasks |
+| `results/retrieval_metrics.json` | top-k label-agreement scores |
+| `results/decoder_metrics.json` | training loss, test perplexity, ablation comparison |
+| `results/qualitative_samples.json` | 5 generation examples (RAG vs baseline) |
+| `results/encoder_curves.png`, `results/decoder_loss.png` | plots |
+
+Discussion, hyper-parameter log and ablation analysis are in `report.md`.
+""")
+
 
 # ---------------------------------------------------------------------------
 nb = {
